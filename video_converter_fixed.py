@@ -319,6 +319,10 @@ class VideoConverterApp:
         output_height = 1080
 
         try:
+            # CORRECCIÓN: Normalizar rutas (Windows)
+            cover_path_normalized = cover_path.replace('\\', '/')
+            input_path_normalized = input_path.replace('\\', '/')
+
             # Paso 1: Generar video temporal de la carátula (1 segundo)
             temp_cover_video = tempfile.NamedTemporaryFile(suffix='.mkv', delete=False).name
 
@@ -326,7 +330,7 @@ class VideoConverterApp:
             cmd_cover = [
                 'ffmpeg', '-y',
                 '-loop', '1',
-                '-i', cover_path,
+                '-i', cover_path_normalized,  # Ruta normalizada
                 '-vf', f'scale={output_width}:{output_height}:force_original_aspect_ratio=decrease,'
                        f'pad={output_width}:{output_height}:(ow-iw)/2:(oh-ih)/2,fps={video_fps}',
                 '-t', '1',
@@ -348,9 +352,9 @@ class VideoConverterApp:
             temp_list = tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False, encoding='utf-8').name
 
             with open(temp_list, 'w', encoding='utf-8') as f:
-                # Escapar rutas para Windows
+                # Escapar rutas para concat demuxer
                 cover_escaped = temp_cover_video.replace('\\', '/').replace("'", "'\\''")
-                input_escaped = input_path.replace('\\', '/').replace("'", "'\\''")
+                input_escaped = input_path_normalized.replace("'", "'\\''")  # Ya normalizada arriba
                 f.write(f"file '{cover_escaped}'\n")
                 f.write(f"file '{input_escaped}'\n")
 
@@ -362,13 +366,13 @@ class VideoConverterApp:
                 '-f', 'concat',
                 '-safe', '0',
                 '-i', temp_list,
-                '-i', input_path,  # Input adicional solo para audio/subtítulos
+                '-i', input_path_normalized,  # Input adicional solo para audio/subtítulos (normalizado)
                 '-map', '0:v',  # Video del concat
                 '-map', '1:a:0?',  # Audio del original
             ]
 
-            # Subtítulos
-            subtitles = self.get_subtitle_tracks(input_path)
+            # Subtítulos (usar ruta normalizada)
+            subtitles = self.get_subtitle_tracks(input_path_normalized)
             if output_format == 'mkv' and subtitles:
                 cmd.extend(['-map', '1:s?', '-c:s', 'copy'])
             elif output_format == 'mp4' and subtitles:
@@ -462,13 +466,15 @@ class VideoConverterApp:
             # Mucho más simple y robusto que 1 segundo
             self.log(f"Añadiendo 1 frame de carátula al inicio del video")
 
-            # CORRECCIÓN CRÍTICA: Usar lista de argumentos (subprocess maneja espacios)
-            # -vframes 1 ANTES del -i para limitar solo el input de la carátula
+            # CORRECCIÓN CRÍTICA: Normalizar rutas (Windows usa \ pero FFmpeg prefiere /)
+            cover_path_normalized = cover_path.replace('\\', '/')
+            input_path_normalized = input_path.replace('\\', '/')
+
             cmd.extend([
                 '-loop', '1',
                 '-vframes', '1',  # CLAVE: Solo 1 frame del input de carátula
-                '-i', cover_path,  # Python subprocess maneja espacios automáticamente
-                '-i', input_path,
+                '-i', cover_path_normalized,  # Ruta normalizada
+                '-i', input_path_normalized,  # Ruta normalizada
                 '-filter_complex',
                 # MÉTODO SIMPLIFICADO: 1 frame de carátula + video completo
                 f'[0:v]scale={output_width}:{output_height}:force_original_aspect_ratio=decrease,'
@@ -482,16 +488,19 @@ class VideoConverterApp:
                 '-map', '1:a:0?'  # Audio del segundo input (video original)
             ])
 
-            # Subtítulos del video original (input 1)
-            subtitles = self.get_subtitle_tracks(input_path)
+            # Subtítulos del video original (input 1) - usar ruta normalizada
+            subtitles = self.get_subtitle_tracks(input_path_normalized)
             if output_format == 'mkv' and subtitles:
                 cmd.extend(['-map', '1:s?', '-c:s', 'copy'])
             elif output_format == 'mp4' and subtitles:
                 cmd.extend(['-map', '1:s:0?', '-c:s', 'mov_text'])
         else:
             # Sin carátula
+            # CORRECCIÓN: Normalizar ruta también aquí
+            input_path_normalized = input_path.replace('\\', '/')
+
             cmd.extend([
-                '-i', input_path,
+                '-i', input_path_normalized,
                 '-vf', f'scale={output_width}:{output_height}:force_original_aspect_ratio=decrease,'
                        f'pad={output_width}:{output_height}:(ow-iw)/2:(oh-ih)/2,'
                        f'format=yuv420p,fps={video_fps}',
@@ -499,7 +508,7 @@ class VideoConverterApp:
                 '-map', '0:a:0?'
             ])
 
-            subtitles = self.get_subtitle_tracks(input_path)
+            subtitles = self.get_subtitle_tracks(input_path_normalized)
             if output_format == 'mkv' and subtitles:
                 cmd.extend(['-map', '0:s?', '-c:s', 'copy'])
             elif output_format == 'mp4' and subtitles:
