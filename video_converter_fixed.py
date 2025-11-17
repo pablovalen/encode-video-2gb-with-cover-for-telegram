@@ -301,15 +301,132 @@ class VideoConverterApp:
             self.log(f"Error ejecutando remux: {e}")
             return False
 
+    def transcode_video_with_cover_fallback(self, input_path, output_path, output_format, video_info, cover_path):
+        """Método alternativo: Generar video de carátula temporalmente y concatenar archivos
+
+        Este método es más lento pero más robusto cuando el filtro concat falla
+        """
+        self.log(f"Usando método alternativo: concatenación de archivos")
+
+        import tempfile
+
+        duration = video_info['duration']
+        has_cover = cover_path is not None and os.path.exists(cover_path)
+        target_bitrate = self.calculate_bitrate(duration, 1900000, has_cover=has_cover)
+
+        video_fps = video_info.get('fps', '30')
+        output_width = 1920
+        output_height = 1080
+
+        try:
+            # Paso 1: Generar video temporal de la carátula (1 segundo)
+            temp_cover_video = tempfile.NamedTemporaryFile(suffix='.mkv', delete=False).name
+
+            self.log(f"Generando video temporal de carátula...")
+            cmd_cover = [
+                'ffmpeg', '-y',
+                '-loop', '1',
+                '-i', cover_path,
+                '-vf', f'scale={output_width}:{output_height}:force_original_aspect_ratio=decrease,'
+                       f'pad={output_width}:{output_height}:(ow-iw)/2:(oh-ih)/2,fps={video_fps}',
+                '-t', '1',
+                '-c:v', 'libx264',
+                '-preset', 'ultrafast',
+                '-pix_fmt', 'yuv420p',
+                '-an',  # Sin audio
+                temp_cover_video
+            ]
+
+            result = subprocess.run(cmd_cover, capture_output=True, text=True, encoding='utf-8')
+            if result.returncode != 0:
+                self.log(f"Error generando video de carátula: {result.stderr[:500]}")
+                if os.path.exists(temp_cover_video):
+                    os.remove(temp_cover_video)
+                return False
+
+            # Paso 2: Crear archivo de lista para concat demuxer
+            temp_list = tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False, encoding='utf-8').name
+
+            with open(temp_list, 'w', encoding='utf-8') as f:
+                # Escapar rutas para Windows
+                cover_escaped = temp_cover_video.replace('\\', '/').replace("'", "'\\''")
+                input_escaped = input_path.replace('\\', '/').replace("'", "'\\''")
+                f.write(f"file '{cover_escaped}'\n")
+                f.write(f"file '{input_escaped}'\n")
+
+            self.log(f"Concatenando carátula + video y transcodificando con NVENC...")
+
+            # Paso 3: Concatenar y transcodificar
+            cmd = [
+                'ffmpeg', '-y',
+                '-f', 'concat',
+                '-safe', '0',
+                '-i', temp_list,
+                '-i', input_path,  # Input adicional solo para audio/subtítulos
+                '-map', '0:v',  # Video del concat
+                '-map', '1:a:0?',  # Audio del original
+            ]
+
+            # Subtítulos
+            subtitles = self.get_subtitle_tracks(input_path)
+            if output_format == 'mkv' and subtitles:
+                cmd.extend(['-map', '1:s?', '-c:s', 'copy'])
+            elif output_format == 'mp4' and subtitles:
+                cmd.extend(['-map', '1:s:0?', '-c:s', 'mov_text'])
+
+            # Codificación NVENC
+            cmd.extend([
+                '-vf', f'scale={output_width}:{output_height}:force_original_aspect_ratio=decrease,'
+                       f'pad={output_width}:{output_height}:(ow-iw)/2:(oh-ih)/2',
+                '-c:v', 'hevc_nvenc',
+                '-preset', self.preset.get(),
+                '-profile:v', 'main',
+                '-tier', 'high',
+                '-rc', 'vbr',
+                '-b:v', f'{target_bitrate}k',
+                '-maxrate', f'{int(target_bitrate * 1.3)}k',
+                '-bufsize', f'{int(target_bitrate * 2)}k',
+                '-c:a', 'aac',
+                '-b:a', '256k',
+                '-ac', '2'
+            ])
+
+            if output_format == 'mp4':
+                cmd.extend(['-movflags', '+faststart'])
+
+            cmd.append(output_path)
+
+            process = subprocess.run(cmd, capture_output=True, text=True, encoding='utf-8')
+
+            # Limpiar archivos temporales
+            if os.path.exists(temp_cover_video):
+                os.remove(temp_cover_video)
+            if os.path.exists(temp_list):
+                os.remove(temp_list)
+
+            if process.returncode == 0:
+                output_size_mb = os.path.getsize(output_path) / (1024 * 1024)
+                self.log(f"✓ Transcodificación completada (método alternativo)")
+                self.log(f"  Tamaño final: {output_size_mb:.1f} MB")
+                return True
+            else:
+                self.log(f"Error en método alternativo: {process.stderr[:1000]}")
+                return False
+
+        except Exception as e:
+            self.log(f"Error en método alternativo: {e}")
+            return False
+
     def transcode_video(self, input_path, output_path, output_format, video_info, cover_path):
         """Transcodificar video con H265 NVEnc optimizado - Para archivos > 2GB
 
         CORRECCIONES IMPLEMENTADAS:
         1. Eliminado -cq para usar VBR con bitrate target correcto
         2. Cálculo de bitrate incluye el segundo de la carátula
-        3. Filtro concat con framerate igualado
+        3. Filtro concat con framerate igualado y número exacto de frames
         4. Uso de -multipass de NVENC en lugar de -2pass
         5. Filtros simplificados para evitar problemas CPU/GPU
+        6. Método de respaldo si concat filter falla
         """
         self.log(f"Iniciando transcodificación NVENC: {os.path.basename(input_path)}")
 
@@ -341,7 +458,7 @@ class VideoConverterApp:
 
         if has_cover:
             # CORRECCIÓN: Configurar la carátula con el framerate del video
-            # Parsear framerate para logging
+            # Parsear framerate para calcular número de frames
             try:
                 if '/' in video_fps:
                     num, den = video_fps.split('/')
@@ -351,23 +468,28 @@ class VideoConverterApp:
             except:
                 fps_value = 30.0
 
-            self.log(f"Configurando carátula a {fps_value:.3f} fps para coincidir con el video")
+            # Calcular número exacto de frames para 1 segundo
+            num_frames = round(fps_value)  # Redondear al frame más cercano
 
+            self.log(f"Configurando carátula a {fps_value:.3f} fps ({num_frames} frames para 1 segundo)")
+
+            # MÉTODO MEJORADO: Usar número exacto de frames en lugar de duración
+            # Esto evita problemas con framerates no-enteros (23.976, 29.97, etc.)
             cmd.extend([
                 '-loop', '1',
-                '-framerate', video_fps,  # CORRECCIÓN: Usar la forma exacta (fracción o decimal)
-                '-t', '1',  # 1 segundo de duración
+                '-r', video_fps,  # Forzar framerate de salida
+                '-vframes', str(num_frames),  # Número exacto de frames (en lugar de -t 1)
                 '-i', cover_path,
                 '-i', input_path,
                 '-filter_complex',
-                # CORRECCIÓN: Filtro con setpts para asegurar sincronización
+                # Filtro simplificado - sin fps filter porque ya está correcto
                 f'[0:v]scale={output_width}:{output_height}:force_original_aspect_ratio=decrease,'
                 f'pad={output_width}:{output_height}:(ow-iw)/2:(oh-ih)/2,'
-                f'format=yuv420p,fps={video_fps},setpts=PTS-STARTPTS[cover];'
+                f'format=yuv420p,setpts=PTS-STARTPTS[cover];'
                 f'[1:v]scale={output_width}:{output_height}:force_original_aspect_ratio=decrease,'
                 f'pad={output_width}:{output_height}:(ow-iw)/2:(oh-ih)/2,'
-                f'format=yuv420p,fps={video_fps},setpts=PTS-STARTPTS[main];'
-                f'[cover][main]concat=n=2:v=1:a=0[vout]',
+                f'format=yuv420p,setpts=PTS-STARTPTS[main];'
+                f'[cover][main]concat=n=2:v=1:a=0,fps={video_fps}[vout]',  # fps al final del concat
                 '-map', '[vout]',
                 '-map', '1:a:0?'  # Audio del segundo input (video original)
             ])
@@ -473,16 +595,45 @@ class VideoConverterApp:
                     self.log(f"✗ Error: No se generó el archivo de salida")
                     return False
             else:
-                stderr = process.stderr.read() if hasattr(process.stderr, 'read') else ""
+                stderr_output = ""
+                try:
+                    # Intentar leer stderr si está disponible
+                    if hasattr(process.stderr, 'read'):
+                        stderr_output = process.stderr.read()
+                except:
+                    pass
+
                 self.log(f"Error en codificación. Código de salida: {process.returncode}")
-                if stderr:
-                    self.log(f"Detalles: {stderr[:1000]}")
-                return False
+
+                # Verificar si es error de filtro concat
+                is_filter_error = (
+                    'reinitializing filters' in stderr_output.lower() or
+                    'error code: -22' in stderr_output.lower() or
+                    'invalid argument' in stderr_output.lower()
+                )
+
+                if is_filter_error and has_cover:
+                    self.log(f"⚠ Detectado error en filtro concat")
+                    self.log(f"→ Intentando con método alternativo (concatenación de archivos)...")
+                    return self.transcode_video_with_cover_fallback(
+                        input_path, output_path, output_format, video_info, cover_path
+                    )
+                else:
+                    if stderr_output:
+                        self.log(f"Detalles: {stderr_output[:1000]}")
+                    return False
 
         except Exception as e:
             self.log(f"Error ejecutando transcodificación: {e}")
             import traceback
             self.log(f"Traceback: {traceback.format_exc()}")
+
+            # Si hay carátula, intentar método alternativo
+            if has_cover:
+                self.log(f"→ Intentando con método alternativo...")
+                return self.transcode_video_with_cover_fallback(
+                    input_path, output_path, output_format, video_info, cover_path
+                )
             return False
 
     def process_video(self, source_file, source_dir, dest_base):
