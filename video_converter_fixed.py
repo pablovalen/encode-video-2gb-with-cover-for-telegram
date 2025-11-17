@@ -341,7 +341,7 @@ class VideoConverterApp:
 
         if has_cover:
             # CORRECCIÓN: Configurar la carátula con el framerate del video
-            # Parsear framerate (puede venir como "30000/1001" o "30")
+            # Parsear framerate para logging
             try:
                 if '/' in video_fps:
                     num, den = video_fps.split('/')
@@ -355,18 +355,18 @@ class VideoConverterApp:
 
             cmd.extend([
                 '-loop', '1',
-                '-framerate', str(fps_value),  # Usar el mismo framerate del video
+                '-framerate', video_fps,  # CORRECCIÓN: Usar la forma exacta (fracción o decimal)
                 '-t', '1',  # 1 segundo de duración
                 '-i', cover_path,
                 '-i', input_path,
                 '-filter_complex',
-                # CORRECCIÓN: Filtro simplificado que mantiene el framerate consistente
+                # CORRECCIÓN: Filtro con setpts para asegurar sincronización
                 f'[0:v]scale={output_width}:{output_height}:force_original_aspect_ratio=decrease,'
                 f'pad={output_width}:{output_height}:(ow-iw)/2:(oh-ih)/2,'
-                f'format=yuv420p,fps={video_fps}[cover];'
+                f'format=yuv420p,fps={video_fps},setpts=PTS-STARTPTS[cover];'
                 f'[1:v]scale={output_width}:{output_height}:force_original_aspect_ratio=decrease,'
                 f'pad={output_width}:{output_height}:(ow-iw)/2:(oh-ih)/2,'
-                f'format=yuv420p,fps={video_fps}[main];'
+                f'format=yuv420p,fps={video_fps},setpts=PTS-STARTPTS[main];'
                 f'[cover][main]concat=n=2:v=1:a=0[vout]',
                 '-map', '[vout]',
                 '-map', '1:a:0?'  # Audio del segundo input (video original)
