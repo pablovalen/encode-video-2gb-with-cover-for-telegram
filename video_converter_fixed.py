@@ -433,11 +433,12 @@ class VideoConverterApp:
         duration = video_info['duration']
         has_cover = cover_path is not None and os.path.exists(cover_path)
 
-        # CORRECCIÓN: Calcular bitrate incluyendo el segundo de carátula si existe
-        target_bitrate = self.calculate_bitrate(duration, 1900000, has_cover=has_cover)
+        # CORRECCIÓN: Bitrate para duración original (1 frame es despreciable, ~0.04s)
+        # Ya no añadimos 1 segundo, solo 1 frame
+        target_bitrate = self.calculate_bitrate(duration, 1900000, has_cover=False)
 
         if has_cover:
-            self.log(f"Bitrate objetivo: {target_bitrate} kbps (calculado para {duration:.1f}s + 1s carátula)")
+            self.log(f"Bitrate objetivo: {target_bitrate} kbps (calculado para {duration:.1f}s + 1 frame carátula)")
         else:
             self.log(f"Bitrate objetivo: {target_bitrate} kbps (calculado para {duration:.1f}s)")
 
@@ -457,39 +458,26 @@ class VideoConverterApp:
         cmd = ['ffmpeg', '-y']
 
         if has_cover:
-            # CORRECCIÓN: Configurar la carátula con el framerate del video
-            # Parsear framerate para calcular número de frames
-            try:
-                if '/' in video_fps:
-                    num, den = video_fps.split('/')
-                    fps_value = float(num) / float(den)
-                else:
-                    fps_value = float(video_fps)
-            except:
-                fps_value = 30.0
+            # MÉTODO SIMPLIFICADO: Solo 1 frame de carátula
+            # Mucho más simple y robusto que 1 segundo
+            self.log(f"Añadiendo 1 frame de carátula al inicio del video")
 
-            # Calcular número exacto de frames para 1 segundo
-            num_frames = round(fps_value)  # Redondear al frame más cercano
-
-            self.log(f"Configurando carátula a {fps_value:.3f} fps ({num_frames} frames para 1 segundo)")
-
-            # MÉTODO MEJORADO: Usar número exacto de frames en lugar de duración
-            # Esto evita problemas con framerates no-enteros (23.976, 29.97, etc.)
+            # CORRECCIÓN CRÍTICA: Usar lista de argumentos (subprocess maneja espacios)
+            # -vframes 1 ANTES del -i para limitar solo el input de la carátula
             cmd.extend([
                 '-loop', '1',
-                '-r', video_fps,  # Forzar framerate de salida
-                '-vframes', str(num_frames),  # Número exacto de frames (en lugar de -t 1)
-                '-i', cover_path,
+                '-vframes', '1',  # CLAVE: Solo 1 frame del input de carátula
+                '-i', cover_path,  # Python subprocess maneja espacios automáticamente
                 '-i', input_path,
                 '-filter_complex',
-                # Filtro simplificado - sin fps filter porque ya está correcto
+                # MÉTODO SIMPLIFICADO: 1 frame de carátula + video completo
                 f'[0:v]scale={output_width}:{output_height}:force_original_aspect_ratio=decrease,'
                 f'pad={output_width}:{output_height}:(ow-iw)/2:(oh-ih)/2,'
-                f'format=yuv420p,setpts=PTS-STARTPTS[cover];'
+                f'format=yuv420p[cover];'
                 f'[1:v]scale={output_width}:{output_height}:force_original_aspect_ratio=decrease,'
                 f'pad={output_width}:{output_height}:(ow-iw)/2:(oh-ih)/2,'
-                f'format=yuv420p,setpts=PTS-STARTPTS[main];'
-                f'[cover][main]concat=n=2:v=1:a=0,fps={video_fps}[vout]',  # fps al final del concat
+                f'format=yuv420p[main];'
+                f'[cover][main]concat=n=2:v=1:a=0[vout]',
                 '-map', '[vout]',
                 '-map', '1:a:0?'  # Audio del segundo input (video original)
             ])
